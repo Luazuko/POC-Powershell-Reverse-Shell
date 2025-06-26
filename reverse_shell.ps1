@@ -13,8 +13,23 @@ param (
 )
 
 
-$socket = New-Object System.Net.Sockets.TcpClient($address, $port)
-$socket_stream = $socket.GetStream()
+try
+{
+    $socket = New-Object System.Net.Sockets.TcpClient($address, $port)
+    $socket_stream = $socket.GetStream()
+}
+catch
+{
+    if ($socket)
+    {
+        $socket.Dispose()
+    }
+
+    Write-Error "Failed to establish communication: $_"
+    exit 1
+}
+
+
 $socket_mutex_name = [Guid]::NewGuid().ToString()
 
 $process_start_info = New-Object System.Diagnostics.ProcessStartInfo($filename, $arguments)
@@ -26,7 +41,19 @@ $process_start_info.RedirectStandardError = $true
 
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $process_start_info
-[void]$process.Start()
+
+
+try
+{
+    [void]$process.Start()
+}
+catch
+{
+    $socket.Dispose()
+
+    Write-Error "Failed to start process: $_"
+    exit 1
+}
 
 
 $input_redirector = {
@@ -52,7 +79,11 @@ $input_redirector = {
             $to.Flush()
             [Array]::Clear($buffer, 0, $bytes_read_count)
         } 
-        catch { <# shh... #> }
+        catch
+        {
+            Write-Error "Something went wrong during socket output -> process input piping: $_"
+            break
+        }
     }
 }
 
@@ -104,48 +135,50 @@ $output_redirector = {
                 }
             }
         }
-        catch {}
+        catch
+        {
+            Write-Error "Something wen't wrong during process output -> socket input piping: $_"
+            break
+        }
     }
 }
 
 
-$stdin_handler = Start-ThreadJob -ScriptBlock $input_redirector -ArgumentList $socket_stream, $process.StandardInput.BaseStream
-$stdout_handler = Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardOutput.BaseStream, $socket_stream, $socket_mutex_name
-$stderr_handler = Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardError.BaseStream, $socket_stream, $socket_mutex_name
+$jobs = @(
+    # handler for socket -> stdin
+    (Start-ThreadJob -ScriptBlock $input_redirector -ArgumentList $socket_stream, $process.StandardInput.BaseStream),
+    # handler for stdout -> socket
+    (Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardOutput.BaseStream, $socket_stream, $socket_mutex_name),
+    # handler for stderr -> socket
+    (Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardError.BaseStream, $socket_stream, $socket_mutex_name)
+)
 
 
 while ($true)
 {
-    $stdin_handler_state = (Get-Job -Id $stdin_handler.Id).State
-    $stdout_handler_state = (Get-Job -Id $stdout_handler.Id).State
-    $stderr_handler_state = (Get-Job -Id $stderr_handler.Id).State
-    
-    # this completes when the connection is terminated
-    if ($stdin_handler_state -eq 'Completed' -or $stdin_handler_state -eq 'Failed')
+    $job_states = $jobs | ForEach-Object { Get-Job -Id $_.Id }
+    $jobs_failed = $job_states | Where-Object { $_.State -eq 'Failed' }
+    $jobs_completed = $job_states | Where-Object { $_.State -eq 'Completed' }
+
+    if ($jobs_failed)
+    {
+        $jobs_failed | ForEach-Object { Receive-Job -Job $_.Id }
+        break
+    }
+
+    if ($jobs_completed)
     {
         break
     }
 
-    # these complete when the process exits
-    if ($stdout_handler_state -eq 'Completed' -or $stdout_handler_state -eq 'Failed')
-    {
-        break
-    }
-
-    if ($stderr_handler_state -eq 'Completed' -or $stderr_handler_state -eq 'Failed')
-    {
-        break
-    }
+    Start-Sleep -Milliseconds 250
 }
 
 
-Stop-Job $stdin_handler
-Stop-Job $stdout_handler
-Stop-Job $stderr_handler
-
-Remove-Job $stdin_handler -Force
-Remove-Job $stdout_handler -Force
-Remove-Job $stderr_handler -Force
+$jobs | ForEach-Object {
+    Stop-Job -Job $_
+    Remove-Job -Job $_ -Force
+}
 
 $process.Dispose()
 $socket.Dispose()
