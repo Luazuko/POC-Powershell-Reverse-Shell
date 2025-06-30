@@ -1,4 +1,4 @@
-# Compatible with Powershell 7+
+# Compatible with Powershell 3+
 
 param (
     [Parameter(Position = 0, Mandatory = $true)]
@@ -47,7 +47,7 @@ try
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $process_start_info
-
+    
     [void]$process.Start()
 }
 catch
@@ -150,39 +150,40 @@ $output_redirector = {
 
 $socket_mutex_name = [Guid]::NewGuid().ToString()
 
-$jobs = @(
-    # handler for socket -> stdin
-    (Start-ThreadJob -ScriptBlock $input_redirector -ArgumentList $socket_stream, $process.StandardInput.BaseStream),
-    # handler for stdout -> socket
-    (Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardOutput.BaseStream, $socket_stream, $socket_mutex_name),
-    # handler for stderr -> socket
-    (Start-ThreadJob -ScriptBlock $output_redirector -ArgumentList $process.StandardError.BaseStream, $socket_stream, $socket_mutex_name)
+$runspace_pool = [RunspaceFactory]::CreateRunspacePool(3, 3)
+$runspace_pool.Open()
+
+$threads = @()
+$scripts = @(
+    [PowerShell]::Create().AddScript($input_redirector).AddArgument($socket_stream).AddArgument($process.StandardInput.BaseStream),
+    [PowerShell]::Create().AddScript($output_redirector).AddArgument($process.StandardOutput.BaseStream).AddArgument($socket_stream).AddArgument($socket_mutex_name),
+    [PowerShell]::Create().AddScript($output_redirector).AddArgument($process.StandardError.BaseStream).AddArgument($socket_stream).AddArgument($socket_mutex_name)
 )
+
+$scripts | ForEach-Object {
+    $_.RunspacePool = $runspace_pool
+    $threads += $_.InvokeAsync()
+}
 
 
 while ($true)
 {
-    $job_states = $jobs | ForEach-Object { Get-Job -Id $_.Id }
-    $jobs_completed = $job_states | Where-Object { $_.State -eq 'Completed' }
-    $jobs_failed = $job_states | Where-Object { $_.State -eq 'Failed' }
+    $threads_completed = $threads | Where-Object { $_.IsCompleted }
+    $threads_faulted = $threads | Where-Object { $_.IsFaulted }
 
-    if ($jobs_completed -or $jobs_failed)
+    if ($threads_completed -or $threads_faulted)
     {
-        $jobs_failed | ForEach-Object {
-            Receive-Job -Job $_ -ErrorAction SilentlyContinue
+        $threads_faulted | ForEach-Object {
+            Write-Error $_.Exception.Message
         }
 
         break
     }
-
+    
     Start-Sleep -Milliseconds 250
 }
 
 
-$jobs | ForEach-Object {
-    Stop-Job -Job $_
-    Remove-Job -Job $_ -Force
-}
-
+$runspace_pool.Dispose()
 $process.Dispose()
 $socket.Dispose()
